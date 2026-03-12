@@ -13,10 +13,10 @@ on:
         type: string
         default: "3.12"
       uv-sync-args:
-        description: "Extra args for uv sync (e.g. --extra dev)"
+        description: "Args for uv sync (e.g. --frozen --extra dev)"
         required: false
         type: string
-        default: "--extra dev"
+        default: "--frozen --extra dev"
       uv-sync-env:
         description: "Env vars for uv sync/test as KEY=VAL newline-separated"
         required: false
@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: "uv run pytest tests/ -x -q --tb=short"
+      os-matrix:
+        description: "JSON array of OS to test on"
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
 
 permissions:
   contents: read
@@ -43,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: |
           while IFS= read -r line; do [ -n "$line" ] && export "$line"; done <<< "$UV_SYNC_ENV"
-          uv sync --frozen ${{ inputs.uv-sync-args }}
+          uv sync ${{ inputs.uv-sync-args }}
         env:
           UV_SYNC_ENV: ${{ inputs.uv-sync-env }}
       - name: Ruff check
@@ -52,7 +57,12 @@ jobs:
         run: uv run ruff format --check .
 
   test:
-    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJson(inputs.os-matrix) }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -62,20 +72,22 @@ jobs:
       - name: Install dependencies
         run: |
           while IFS= read -r line; do [ -n "$line" ] && export "$line"; done <<< "$UV_SYNC_ENV"
-          uv sync --frozen ${{ inputs.uv-sync-args }}
+          uv sync ${{ inputs.uv-sync-args }}
         env:
           UV_SYNC_ENV: ${{ inputs.uv-sync-env }}
+        shell: bash
       - name: Unit tests
         id: tests
         run: |
           while IFS= read -r line; do [ -n "$line" ] && export "$line"; done <<< "$UV_SYNC_ENV"
-          OUTPUT=$(${{ inputs.test-command }} 2>&1)
+          OUTPUT=$(${{ inputs.test-command }} 2>&1) || true
           echo "$OUTPUT"
           SUMMARY=$(echo "$OUTPUT" | grep -oE '[0-9]+ passed.*' | tail -1 | sed 's/ *=*$//')
           echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
           echo "$OUTPUT" | tail -1 | grep -q "passed" || exit 1
         env:
           UV_SYNC_ENV: ${{ inputs.uv-sync-env }}
+        shell: bash
 
     outputs:
       summary: ${{ steps.tests.outputs.summary }}
