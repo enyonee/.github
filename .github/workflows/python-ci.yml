@@ -1,0 +1,115 @@
+name: Python CI
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project name (for notifications)
+        required: true
+        type: string
+      python-version:
+        description: Python version
+        required: false
+        type: string
+        default: "3.12"
+      uv-sync-args:
+        description: "Extra args for uv sync (e.g. --extra dev)"
+        required: false
+        type: string
+        default: "--extra dev"
+      uv-sync-env:
+        description: "Env vars for uv sync/test as KEY=VAL newline-separated"
+        required: false
+        type: string
+        default: ""
+      test-command:
+        description: "Pytest command"
+        required: false
+        type: string
+        default: "uv run pytest tests/ -x -q --tb=short"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install dependencies
+        run: |
+          while IFS= read -r line; do [ -n "$line" ] && export "$line"; done <<< "$UV_SYNC_ENV"
+          uv sync --frozen ${{ inputs.uv-sync-args }}
+        env:
+          UV_SYNC_ENV: ${{ inputs.uv-sync-env }}
+      - name: Ruff check
+        run: uv run ruff check .
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install dependencies
+        run: |
+          while IFS= read -r line; do [ -n "$line" ] && export "$line"; done <<< "$UV_SYNC_ENV"
+          uv sync --frozen ${{ inputs.uv-sync-args }}
+        env:
+          UV_SYNC_ENV: ${{ inputs.uv-sync-env }}
+      - name: Unit tests
+        id: tests
+        run: |
+          while IFS= read -r line; do [ -n "$line" ] && export "$line"; done <<< "$UV_SYNC_ENV"
+          OUTPUT=$(${{ inputs.test-command }} 2>&1)
+          echo "$OUTPUT"
+          SUMMARY=$(echo "$OUTPUT" | grep -oE '[0-9]+ passed.*' | tail -1 | sed 's/ *=*$//')
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" | tail -1 | grep -q "passed" || exit 1
+        env:
+          UV_SYNC_ENV: ${{ inputs.uv-sync-env }}
+
+    outputs:
+      summary: ${{ steps.tests.outputs.summary }}
+
+  notify:
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Determine status
+        id: status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ needs.lint.result }}" = "success" ] && [ "${{ needs.test.result }}" = "success" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+          VERSION=$(gh api repos/${{ github.repository }}/tags --jq '.[0].name' 2>/dev/null || echo "")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram
+        uses: enyonee/telegram-notify-action@v2
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          status: ${{ steps.status.outputs.result }}
+          project: ${{ inputs.project }}
+          version: ${{ steps.status.outputs.version }}
+          event: CI
+          branch: ${{ github.head_ref || github.ref_name }}
+          pr: ${{ github.event.pull_request.number }}
+          body: |
+            ${{ needs.lint.result == 'success' && '✅' || '❌' }} Lint
+            ${{ needs.test.result == 'success' && '✅' || '❌' }} Tests: ${{ needs.test.outputs.summary }}
