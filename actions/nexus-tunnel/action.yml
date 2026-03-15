@@ -1,0 +1,72 @@
+name: "Nexus SSH Tunnel"
+description: "Setup SSH tunnel to Nexus Docker registry for custom pipelines"
+
+inputs:
+  ssh_key:
+    description: "SSH private key for ci-tunnel user"
+    required: true
+  host_key:
+    description: "SSH host key (ssh-keyscan output) for MITM protection"
+    required: true
+  host:
+    description: "VPS host address"
+    required: true
+  local_port:
+    description: "Local port for tunnel (default: 8082)"
+    required: false
+    default: "8082"
+
+outputs:
+  tunnel_port:
+    description: "Local port where Nexus is available"
+    value: ${{ inputs.local_port }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup SSH tunnel
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        echo "${{ inputs.ssh_key }}" > ~/.ssh/nexus_key
+        chmod 600 ~/.ssh/nexus_key
+
+        echo "${{ inputs.host_key }}" >> ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
+
+        ssh -f -N \
+          -L ${{ inputs.local_port }}:10.43.53.36:8082 \
+          -i ~/.ssh/nexus_key \
+          -o StrictHostKeyChecking=yes \
+          -o ConnectTimeout=10 \
+          -o ServerAliveInterval=15 \
+          -o ServerAliveCountMax=3 \
+          -o ExitOnForwardFailure=yes \
+          ci-tunnel@${{ inputs.host }}
+
+        # Wait for Nexus API to respond
+        for i in $(seq 1 15); do
+          if curl -sf http://localhost:${{ inputs.local_port }}/v2/ > /dev/null 2>&1; then
+            echo "✅ SSH tunnel to Nexus established on port ${{ inputs.local_port }} (attempt $i)"
+            exit 0
+          fi
+          echo "Waiting for tunnel... ($i/15)"
+          sleep 2
+        done
+
+        echo "❌ Nexus tunnel failed after 30s"
+        exit 1
+
+    - name: Register cleanup
+      shell: bash
+      run: |
+        # Create cleanup script for post-job
+        mkdir -p /tmp/nexus-tunnel
+        cat > /tmp/nexus-tunnel/cleanup.sh << 'EOF'
+        pkill -f "ssh.*nexus" 2>/dev/null || true
+        rm -f ~/.ssh/nexus_key
+        echo "🧹 Nexus tunnel cleaned up"
+        EOF
+        chmod +x /tmp/nexus-tunnel/cleanup.sh
