@@ -80,13 +80,14 @@ jobs:
             -o ExitOnForwardFailure=yes \
             ci-tunnel@${{ secrets.NEXUS_HOST }}
 
-          # Wait for Nexus to respond through tunnel
+          # Wait for Nexus to respond through tunnel (401 = OK, means Nexus is reachable)
           for i in $(seq 1 15); do
-            if curl -sf http://localhost:8082/v2/ > /dev/null 2>&1; then
-              echo "✅ SSH tunnel to Nexus established (attempt $i)"
+            HTTP_CODE=$(curl -so /dev/null -w "%{http_code}" http://localhost:8082/v2/ 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+              echo "✅ SSH tunnel to Nexus established (attempt $i, HTTP $HTTP_CODE)"
               exit 0
             fi
-            echo "Waiting for tunnel... ($i/15)"
+            echo "Waiting for tunnel... ($i/15, HTTP $HTTP_CODE)"
             sleep 2
           done
 

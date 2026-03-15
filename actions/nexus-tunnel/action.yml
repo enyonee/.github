@@ -46,13 +46,14 @@ runs:
           -o ExitOnForwardFailure=yes \
           ci-tunnel@${{ inputs.host }}
 
-        # Wait for Nexus API to respond
+        # Wait for Nexus API to respond (401 = OK, means Nexus is reachable)
         for i in $(seq 1 15); do
-          if curl -sf http://localhost:${{ inputs.local_port }}/v2/ > /dev/null 2>&1; then
-            echo "✅ SSH tunnel to Nexus established on port ${{ inputs.local_port }} (attempt $i)"
+          HTTP_CODE=$(curl -so /dev/null -w "%{http_code}" http://localhost:${{ inputs.local_port }}/v2/ 2>/dev/null || echo "000")
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+            echo "✅ SSH tunnel to Nexus established on port ${{ inputs.local_port }} (attempt $i, HTTP $HTTP_CODE)"
             exit 0
           fi
-          echo "Waiting for tunnel... ($i/15)"
+          echo "Waiting for tunnel... ($i/15, HTTP $HTTP_CODE)"
           sleep 2
         done
 
