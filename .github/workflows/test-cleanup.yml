@@ -1,0 +1,71 @@
+name: Cleanup Test Deployment (PR Closed)
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Image name (e.g. mediamule, quickfile)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+    secrets:
+      VDS_SSH_KEY:
+        description: "SSH key for deploy@k3s"
+        required: true
+      VDS_HOST:
+        description: "K3s host address"
+        required: true
+      VDS_HOST_KEY:
+        description: "SSH host key for k3s server"
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.VDS_SSH_KEY }}" > ~/.ssh/vds_key
+          chmod 600 ~/.ssh/vds_key
+          echo "${{ secrets.VDS_HOST_KEY }}" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Delete test deployment
+        run: |
+          DEPLOY_NAME="${{ inputs.image_name }}-pr-${{ inputs.pr_number }}"
+
+          echo "🗑️ Cleaning up ${DEPLOY_NAME} from test namespace..."
+
+          ssh -i ~/.ssh/vds_key deploy@${{ secrets.VDS_HOST }} \
+            "sudo kubectl delete deployment ${DEPLOY_NAME} -n test --ignore-not-found=true && \
+             sudo kubectl delete service ${DEPLOY_NAME} -n test --ignore-not-found=true"
+
+          echo "✅ Cleaned up ${DEPLOY_NAME}"
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/vds_key
+
+      - name: Notify Telegram
+        if: success()
+        uses: enyonee/telegram-notify-action@v2
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          status: success
+          project: ${{ inputs.image_name }}
+          version: "PR #${{ inputs.pr_number }}"
+          event: "Test Cleanup"

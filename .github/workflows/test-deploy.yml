@@ -1,0 +1,184 @@
+name: Deploy PR to Test Namespace
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Image name in Nexus (e.g. mediamule, quickfile)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+      container_port:
+        description: "Container port for the app (default: 8080)"
+        required: false
+        type: string
+        default: "8080"
+    secrets:
+      VDS_SSH_KEY:
+        description: "SSH key for deploy@k3s"
+        required: true
+      VDS_HOST:
+        description: "K3s host address"
+        required: true
+      VDS_HOST_KEY:
+        description: "SSH host key for k3s server"
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.VDS_SSH_KEY }}" > ~/.ssh/vds_key
+          chmod 600 ~/.ssh/vds_key
+          echo "${{ secrets.VDS_HOST_KEY }}" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy to test namespace
+        run: |
+          IMAGE="${{ inputs.image_name }}"
+          PR="${{ inputs.pr_number }}"
+          DEPLOY_NAME="${IMAGE}-pr-${PR}"
+          NEXUS_REGISTRY="nexus.shared.svc.cluster.local:8082"
+          IMAGE_TAG="pr-${PR}"
+          PORT="${{ inputs.container_port }}"
+
+          cat <<MANIFEST | ssh -i ~/.ssh/vds_key deploy@${{ secrets.VDS_HOST }} "sudo kubectl apply -f -"
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${DEPLOY_NAME}
+            namespace: test
+            labels:
+              app: ${DEPLOY_NAME}
+              pr: "${PR}"
+              project: ${IMAGE}
+              managed-by: github-actions
+          spec:
+            replicas: 1
+            strategy:
+              type: Recreate
+            selector:
+              matchLabels:
+                app: ${DEPLOY_NAME}
+            template:
+              metadata:
+                labels:
+                  app: ${DEPLOY_NAME}
+                  pr: "${PR}"
+                  project: ${IMAGE}
+              spec:
+                imagePullSecrets:
+                - name: nexus-registry
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 1000
+                  runAsGroup: 1000
+                  fsGroup: 1000
+                containers:
+                - name: app
+                  image: ${NEXUS_REGISTRY}/${IMAGE}:${IMAGE_TAG}
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: ${PORT}
+                    protocol: TCP
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 64Mi
+                    limits:
+                      cpu: 200m
+                      memory: 256Mi
+                  readinessProbe:
+                    tcpSocket:
+                      port: ${PORT}
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                    failureThreshold: 3
+                  livenessProbe:
+                    tcpSocket:
+                      port: ${PORT}
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    failureThreshold: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${DEPLOY_NAME}
+            namespace: test
+            labels:
+              app: ${DEPLOY_NAME}
+              pr: "${PR}"
+              project: ${IMAGE}
+              managed-by: github-actions
+          spec:
+            type: ClusterIP
+            selector:
+              app: ${DEPLOY_NAME}
+            ports:
+            - port: ${PORT}
+              targetPort: ${PORT}
+              protocol: TCP
+          MANIFEST
+
+          echo "✅ Deployed ${DEPLOY_NAME} to test namespace"
+          echo "   Image: ${NEXUS_REGISTRY}/${IMAGE}:${IMAGE_TAG}"
+          echo "   Service: ${DEPLOY_NAME}.test.svc.cluster.local:${PORT}"
+
+      - name: Wait for rollout
+        run: |
+          DEPLOY_NAME="${{ inputs.image_name }}-pr-${{ inputs.pr_number }}"
+          ssh -i ~/.ssh/vds_key deploy@${{ secrets.VDS_HOST }} \
+            "sudo kubectl rollout status deployment/${DEPLOY_NAME} -n test --timeout=120s" || {
+            echo "⚠️ Rollout didn't complete in 120s, checking pod status..."
+            ssh -i ~/.ssh/vds_key deploy@${{ secrets.VDS_HOST }} \
+              "sudo kubectl get pods -n test -l app=${DEPLOY_NAME} -o wide"
+            exit 1
+          }
+
+      - name: Verify pod running
+        run: |
+          DEPLOY_NAME="${{ inputs.image_name }}-pr-${{ inputs.pr_number }}"
+          ssh -i ~/.ssh/vds_key deploy@${{ secrets.VDS_HOST }} \
+            "sudo kubectl get pods -n test -l app=${DEPLOY_NAME} -o wide && echo '---' && sudo kubectl logs -n test -l app=${DEPLOY_NAME} --tail=20"
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/vds_key
+
+      - name: Notify Telegram
+        if: success()
+        uses: enyonee/telegram-notify-action@v2
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          status: success
+          project: ${{ inputs.image_name }}
+          version: "PR #${{ inputs.pr_number }}"
+          event: "Test Deploy"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        uses: enyonee/telegram-notify-action@v2
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          status: failure
+          project: ${{ inputs.image_name }}
+          version: "PR #${{ inputs.pr_number }}"
+          event: "Test Deploy"
