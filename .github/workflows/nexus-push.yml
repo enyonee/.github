@@ -55,6 +55,8 @@ jobs:
   build-push:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Skip if PR was closed without merge (cleanup job handles closed PRs)
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'closed') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -108,16 +110,25 @@ jobs:
         run: |
           REGISTRY="localhost:8082"
           IMAGE="${{ inputs.image_name }}"
-          REF="${{ inputs.tag || github.ref_name }}"
 
-          if [[ "$REF" =~ ^v[0-9] ]]; then
-            VERSION="${REF#v}"
-            TAGS="${REGISTRY}/${IMAGE}:${VERSION},${REGISTRY}/${IMAGE}:latest"
-            echo "verify_tag=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Determine tag based on event type
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR build: tag as pr-<number>
+            TAG="pr-${{ github.event.pull_request.number }}"
+            TAGS="${REGISTRY}/${IMAGE}:${TAG}"
+            echo "verify_tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "📦 PR build: ${IMAGE}:${TAG}"
           else
-            SAFE_REF=$(echo "$REF" | sed 's/[^a-zA-Z0-9._-]/-/g' | head -c 128)
-            TAGS="${REGISTRY}/${IMAGE}:${SAFE_REF}"
-            echo "verify_tag=${SAFE_REF}" >> "$GITHUB_OUTPUT"
+            REF="${{ inputs.tag || github.ref_name }}"
+            if [[ "$REF" =~ ^v[0-9] ]]; then
+              VERSION="${REF#v}"
+              TAGS="${REGISTRY}/${IMAGE}:${VERSION},${REGISTRY}/${IMAGE}:latest"
+              echo "verify_tag=${VERSION}" >> "$GITHUB_OUTPUT"
+            else
+              SAFE_REF=$(echo "$REF" | sed 's/[^a-zA-Z0-9._-]/-/g' | head -c 128)
+              TAGS="${REGISTRY}/${IMAGE}:${SAFE_REF}"
+              echo "verify_tag=${SAFE_REF}" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
@@ -169,7 +180,7 @@ jobs:
           chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
           status: success
           project: ${{ inputs.image_name }}
-          version: ${{ inputs.tag || github.ref_name }}
+          version: ${{ steps.tags.outputs.verify_tag }}
           event: "Nexus Push"
 
       # --- Cleanup ---
@@ -191,3 +202,79 @@ jobs:
           project: ${{ inputs.image_name }}
           version: ${{ inputs.tag || github.ref_name }}
           event: "Nexus Push"
+
+  # --- Cleanup PR image when PR is closed/merged ---
+  cleanup-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' }}
+    steps:
+      - name: Setup SSH tunnel to Nexus
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          echo "${{ secrets.NEXUS_SSH_KEY }}" > ~/.ssh/nexus_key
+          chmod 600 ~/.ssh/nexus_key
+
+          echo "${{ secrets.NEXUS_HOST_KEY }}" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+          ssh -f -N \
+            -L 8082:10.43.53.36:8082 \
+            -i ~/.ssh/nexus_key \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ExitOnForwardFailure=yes \
+            ci-tunnel@${{ secrets.NEXUS_HOST }}
+
+          for i in $(seq 1 15); do
+            HTTP_CODE=$(curl -so /dev/null -w "%{http_code}" http://localhost:8082/v2/ 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+              echo "✅ SSH tunnel established"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "❌ Tunnel failed"
+          exit 1
+
+      - name: Delete PR image from Nexus
+        run: |
+          IMAGE="${{ inputs.image_name }}"
+          TAG="pr-${{ github.event.pull_request.number }}"
+
+          echo "🗑️ Deleting ${IMAGE}:${TAG} from Nexus..."
+
+          # Get manifest digest for deletion
+          DIGEST=$(curl -s -I \
+            -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            "http://localhost:8082/v2/${IMAGE}/manifests/${TAG}" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json" \
+            | grep -i 'docker-content-digest' | tr -d '\r' | awk '{print $2}')
+
+          if [ -z "$DIGEST" ]; then
+            echo "⚠️ Image ${IMAGE}:${TAG} not found — may have been cleaned already"
+            exit 0
+          fi
+
+          echo "📋 Digest: ${DIGEST}"
+
+          # Delete by digest
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            "http://localhost:8082/v2/${IMAGE}/manifests/${DIGEST}")
+
+          if [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Deleted ${IMAGE}:${TAG} (digest: ${DIGEST})"
+          else
+            echo "⚠️ Delete returned HTTP ${HTTP_CODE} — image may already be gone"
+          fi
+
+      - name: Cleanup SSH tunnel
+        if: always()
+        run: |
+          pkill -f "ssh.*nexus" 2>/dev/null || true
+          rm -f ~/.ssh/nexus_key
