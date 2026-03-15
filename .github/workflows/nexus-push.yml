@@ -160,6 +160,18 @@ jobs:
             exit 1
           fi
 
+      # --- Notify on Success ---
+      - name: Notify Telegram on success
+        if: success()
+        uses: enyonee/telegram-notify-action@v2
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          status: success
+          project: ${{ inputs.image_name }}
+          version: ${{ inputs.tag || github.ref_name }}
+          event: "Nexus Push"
+
       # --- Cleanup ---
       - name: Cleanup SSH tunnel
         if: always()
