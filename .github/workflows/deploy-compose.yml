@@ -1,0 +1,83 @@
+name: Deploy (docker compose)
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project name
+        required: true
+        type: string
+      app_dir:
+        description: Path on server, e.g. /data/mediamule
+        required: true
+        type: string
+      build_local:
+        description: Build and push to localhost:5000 (for projects without GHCR)
+        required: false
+        type: boolean
+        default: false
+      image_name:
+        description: Image name for local build (e.g. research-radar)
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, vps]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        if: ${{ !inputs.build_local }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push to local registry
+        if: ${{ inputs.build_local }}
+        run: |
+          docker build -t localhost:5000/${{ inputs.image_name }}:${{ github.sha }} \
+                        -t localhost:5000/${{ inputs.image_name }}:latest .
+          docker push localhost:5000/${{ inputs.image_name }}:${{ github.sha }}
+          docker push localhost:5000/${{ inputs.image_name }}:latest
+
+      - name: Update compose file
+        run: |
+          if [ -f docker-compose.yml ]; then
+            cp docker-compose.yml ${{ inputs.app_dir }}/docker-compose.yml
+          fi
+
+      - name: Deploy
+        run: |
+          cd ${{ inputs.app_dir }}
+          docker compose pull --ignore-pull-failures 2>/dev/null || true
+          docker compose up -d --remove-orphans
+          docker image prune -f 2>/dev/null || true
+
+      - name: Health check
+        run: |
+          cd ${{ inputs.app_dir }}
+          sleep 10
+          FAILED=0
+          for svc in $(docker compose ps --services); do
+            STATUS=$(docker compose ps $svc --format '{{.Status}}')
+            if echo "$STATUS" | grep -qiE 'unhealthy|exit|restarting'; then
+              echo "FAIL: $svc - $STATUS"
+              docker compose logs $svc --tail=20 --no-color
+              FAILED=1
+            else
+              echo "OK: $svc - $STATUS"
+            fi
+          done
+          [ $FAILED -eq 0 ] || exit 1
+
+      - name: Notify Telegram
+        if: always()
+        uses: enyonee/telegram-notify-action@v2
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          status: ${{ job.status }}
+          project: ${{ inputs.project }}
+          event: Deploy
+          branch: ${{ github.ref_name }}
